@@ -1,0 +1,9 @@
+networkx>=3.0
+numpy>=1.23
+pandas>=1.5
+scipy>=1.10
+matplotlib>=3.7
+tqdm>=4.65
+openpyxl>=3.1
+python-igraph>=0.10
+python-louvain>=0.16
