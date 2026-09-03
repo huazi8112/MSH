@@ -6,7 +6,7 @@ Purpose
 This script evaluates the full HOSH/MSH model and its ablation variants under the
 SIR final infection scale, then reports the improvement percentage of the full model over
 each variant. The main manuscript table reports the average improvement over networks
-for p = 1%, 5%, and 10%, with Wilcoxon significance markers.
+for p = 1%, 5%, and 10%, with BH-adjusted Wilcoxon significance markers and reviewer-requested effect sizes.
 
 Network | p | HOSH-NO | HOSH-NE | HOSH-E | HOSH-C | HOSH-Lin | HOSH-Sqrt | HOSH-SumNorm
 
@@ -26,7 +26,7 @@ Notes
 - Uses common random numbers across HOSH and all variants under the same
   network, seed ratio, simulation block, and repeat index.
 - Common random numbers are used across the full model and all variants.
-- Network-level paired Wilcoxon tests are used for the manuscript summary table.
+- Exact network-level paired Wilcoxon signed-rank tests are used for the manuscript summary table.
 - Block-level paired Wilcoxon tests are also saved for detailed checking.
 """
 
@@ -38,7 +38,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.stats import t, wilcoxon
+from scipy.stats import t, rankdata
 from tqdm import tqdm
 
 from hosh_methods import get_node_scores
@@ -75,26 +75,72 @@ DISPLAY_NAMES = {
     "HOSH-E": "MSH-E",
     "HOSH-C": "MSH-C",
     "HOSH-Lin": "MSH-Lin",
-    "HOSH-Sqrt": "MSH-AltConcave",
+    "HOSH-Sqrt": "MSH-BoxCox",
     "HOSH-SumNorm": "MSH-SumNorm",
 }
 
 
+CATEGORY_NAMES = {
+    "MSH-NO": "Component",
+    "MSH-NE": "Component",
+    "MSH-E": "Component",
+    "MSH-C": "Component",
+    "MSH-Lin": "Function",
+    "MSH-BoxCox": "Function",
+    "MSH-SumNorm": "Function",
+}
+
+
 def paired_wilcoxon_pvalue(x, y) -> float:
-    """Two-sided paired Wilcoxon signed-rank test with safe handling of all-zero differences."""
+    """
+    Exact two-sided paired Wilcoxon signed-rank p-value by exhaustive
+    sign-flip enumeration.
+
+    This function is used for the CROSS-NETWORK ablation comparison,
+    where one network-level mean is one paired observation (n=9).
+
+    Zero differences are removed, consistent with zero_method="wilcox".
+    Average ranks are used for tied absolute differences.
+
+    With n=9, at most 2^9 = 512 sign configurations are enumerated,
+    so no normal approximation is needed and the SciPy small-sample
+    approximation warning is avoided.
+    """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
+
     mask = np.isfinite(x) & np.isfinite(y)
-    x, y = x[mask], y[mask]
-    if len(x) == 0:
-        return np.nan
-    diff = x - y
-    if np.allclose(diff, 0):
+    d = x[mask] - y[mask]
+
+    # Wilcox convention: remove exact zero differences.
+    d = d[d != 0]
+
+    if len(d) == 0:
         return 1.0
-    try:
-        return float(wilcoxon(x, y, zero_method="wilcox", alternative="two-sided").pvalue)
-    except ValueError:
-        return 1.0
+
+    ranks = rankdata(np.abs(d), method="average")
+
+    observed_w_plus = float(np.sum(ranks[d > 0]))
+    total_rank = float(np.sum(ranks))
+    center = total_rank / 2.0
+
+    observed_distance = abs(observed_w_plus - center)
+
+    n = len(d)
+    total_configurations = 1 << n
+    extreme = 0
+
+    # Enumerate all possible sign assignments exactly.
+    for bits in range(total_configurations):
+        w_plus = 0.0
+        for i in range(n):
+            if (bits >> i) & 1:
+                w_plus += ranks[i]
+
+        if abs(w_plus - center) >= observed_distance - 1e-12:
+            extreme += 1
+
+    return float(extreme / total_configurations)
 
 
 def holm_adjust(p_values):
@@ -113,6 +159,58 @@ def holm_adjust(p_values):
         adjusted[idx] = val
         prev = val
     return adjusted.tolist()
+
+
+
+def bh_adjust(p_values):
+    """Benjamini-Hochberg adjustment. NaN values are preserved."""
+    p = np.asarray(p_values, dtype=float)
+    adjusted = np.full_like(p, np.nan, dtype=float)
+
+    valid = np.where(np.isfinite(p))[0]
+    if len(valid) == 0:
+        return adjusted.tolist()
+
+    order = valid[np.argsort(p[valid])]
+    ranked_p = p[order]
+    m = len(order)
+
+    adj = ranked_p * m / np.arange(1, m + 1)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    adj = np.clip(adj, 0.0, 1.0)
+
+    adjusted[order] = adj
+    return adjusted.tolist()
+
+
+def matched_pairs_rank_biserial(x, y) -> float:
+    """
+    Matched-pairs rank-biserial correlation for paired network-level means.
+
+    Differences are defined as d = x - y, where x is MSH and y is the
+    ablation variant. Positive r_rb therefore favors MSH.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    d = x[mask] - y[mask]
+
+    # Match Wilcoxon zero_method="wilcox": remove zero differences.
+    d = d[d != 0]
+
+    if len(d) == 0:
+        return 0.0
+
+    ranks = rankdata(np.abs(d), method="average")
+    w_plus = float(np.sum(ranks[d > 0]))
+    w_minus = float(np.sum(ranks[d < 0]))
+
+    denom = w_plus + w_minus
+    if denom == 0:
+        return 0.0
+
+    return float((w_plus - w_minus) / denom)
 
 
 def significance_stars(p: float) -> str:
@@ -260,6 +358,82 @@ def pct_improvement(full_value: float, variant_value: float) -> float:
 # -----------------------------
 # Table formatting/export
 # -----------------------------
+
+def build_large_gain_raw_table(detail_records: List[dict]) -> pd.DataFrame:
+    """
+    Supplementary raw final-scale table for the large p=1% relative gains.
+
+    Only the reviewer-relevant comparisons are retained:
+    MSH, MSH-NE, MSH-Lin, and MSH-SumNorm.
+
+    Each cell is F(tc) mean ± 95% CI.
+    """
+    df = pd.DataFrame(detail_records)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    methods_needed = [
+        "HOSH",
+        "HOSH-NE",
+        "HOSH-Lin",
+        "HOSH-SumNorm",
+    ]
+
+    sub = df[
+        np.isclose(df["p"].to_numpy(dtype=float), 0.01)
+        & df["Method"].isin(methods_needed)
+    ].copy()
+
+    if sub.empty:
+        return pd.DataFrame()
+
+    sub["Method_Display"] = sub["Method"].map(DISPLAY_NAMES)
+    sub["F(tc) mean ± 95% CI"] = sub.apply(
+        lambda r: (
+            f"{r['Final infection scale mean (%)']:.2f} ± "
+            f"{r['95% CI']:.2f}"
+        ),
+        axis=1,
+    )
+
+    wide = (
+        sub.pivot(
+            index="Network",
+            columns="Method_Display",
+            values="F(tc) mean ± 95% CI",
+        )
+        .reset_index()
+    )
+
+    ordered_cols = [
+        "Network",
+        "MSH",
+        "MSH-NE",
+        "MSH-Lin",
+        "MSH-SumNorm",
+    ]
+    wide = wide[[c for c in ordered_cols if c in wide.columns]]
+
+    # Preserve the original experiment network order.
+    network_order = []
+    for rec in detail_records:
+        name = rec["Network"]
+        if name not in network_order:
+            network_order.append(name)
+
+    wide["__order"] = wide["Network"].map(
+        {name: i for i, name in enumerate(network_order)}
+    )
+    wide = (
+        wide.sort_values("__order")
+        .drop(columns="__order")
+        .reset_index(drop=True)
+    )
+
+    return wide
+
+
 def build_improvement_table(records: List[dict]) -> pd.DataFrame:
     """Build one table: Network, p, variants..., plus Average improvement row."""
     rows = []
@@ -297,12 +471,12 @@ def build_improvement_table(records: List[dict]) -> pd.DataFrame:
 
 
 
-def build_average_improvement_summary(records: List[dict], p_adjust: str = "none"):
+def build_average_improvement_summary(records: List[dict], p_adjust: str = "bh"):
     """
     Main manuscript summary:
     Rows are ablation variants, columns are p=1%, p=5%, p=10%.
     Each cell is the mean improvement rate over networks.
-    Significance is computed by paired Wilcoxon tests over network-level paired means:
+    Significance is computed by exact paired Wilcoxon signed-rank tests over network-level paired means:
         {F_MSH(network), F_variant(network)}, n = number of networks.
     This avoids treating repeated SIR blocks as independent networks.
     """
@@ -315,9 +489,16 @@ def build_average_improvement_summary(records: List[dict], p_adjust: str = "none
             if sub.empty:
                 continue
 
+            full_values = sub["HOSH_F(%)"].to_numpy(dtype=float)
+            variant_values = sub["Variant_F(%)"].to_numpy(dtype=float)
+
             p_network = paired_wilcoxon_pvalue(
-                sub["HOSH_F(%)"].to_numpy(dtype=float),
-                sub["Variant_F(%)"].to_numpy(dtype=float),
+                full_values,
+                variant_values,
+            )
+            r_rb = matched_pairs_rank_biserial(
+                full_values,
+                variant_values,
             )
 
             rows.append({
@@ -331,6 +512,7 @@ def build_average_improvement_summary(records: List[dict], p_adjust: str = "none
                 "Networks": int(sub["Network"].nunique()),
                 "Win_Networks": int(np.sum(sub["Improvement_%"].to_numpy(dtype=float) > 0)),
                 "Network_Wilcoxon_p": p_network,
+                "r_rb": r_rb,
             })
 
     summary = pd.DataFrame(rows)
@@ -338,12 +520,16 @@ def build_average_improvement_summary(records: List[dict], p_adjust: str = "none
     if summary.empty:
         return pd.DataFrame(), pd.DataFrame(), long_df
 
-    if p_adjust.lower() == "holm":
-        summary["P_for_sig"] = holm_adjust(summary["Network_Wilcoxon_p"].tolist())
-        summary["P_Adjustment"] = "Holm"
-    else:
-        summary["P_for_sig"] = summary["Network_Wilcoxon_p"]
-        summary["P_Adjustment"] = "None"
+    # Reviewer-facing multiple-comparison correction:
+    # within each fixed seed ratio, the seven MSH-vs-variant comparisons
+    # form one family and are corrected using Benjamini-Hochberg.
+    summary["P_for_sig"] = np.nan
+    for ratio in SEED_RATIOS:
+        mask = np.isclose(summary["p"].to_numpy(dtype=float), ratio)
+        summary.loc[mask, "P_for_sig"] = bh_adjust(
+            summary.loc[mask, "Network_Wilcoxon_p"].tolist()
+        )
+    summary["P_Adjustment"] = "BH"
 
     summary["Significance"] = summary["P_for_sig"].apply(significance_stars)
     summary["Cell"] = [
@@ -363,11 +549,18 @@ def build_average_improvement_summary(records: List[dict], p_adjust: str = "none
     manuscript = manuscript.sort_values("Variant").reset_index(drop=True)
     manuscript["Variant"] = manuscript["Variant"].astype(str)
 
-    ordered_cols = ["Variant"] + [f"p={int(r * 100)}%" for r in SEED_RATIOS]
+    # Add the Category column used in the manuscript table.
+    manuscript.insert(
+        0,
+        "Category",
+        manuscript["Variant"].map(CATEGORY_NAMES)
+    )
+
+    ordered_cols = ["Category", "Variant"] + [f"p={int(r * 100)}%" for r in SEED_RATIOS]
     manuscript = manuscript[[c for c in ordered_cols if c in manuscript.columns]]
 
     # Round numeric columns in long summary.
-    for col in ["Mean_Improvement(%)", "Median_Improvement(%)", "Std_Improvement(%)", "Network_Wilcoxon_p", "P_for_sig"]:
+    for col in ["Mean_Improvement(%)", "Median_Improvement(%)", "Std_Improvement(%)", "Network_Wilcoxon_p", "P_for_sig", "r_rb"]:
         if col in summary.columns:
             summary[col] = summary[col].astype(float).round(6)
 
@@ -464,8 +657,8 @@ def main() -> None:
     parser.add_argument("--blocks", type=int, default=50, help="Number of SIR simulation blocks.")
     parser.add_argument("--repeats", type=int, default=20, help="SIR realizations per block.")
     parser.add_argument("--output-dir", default="results/exp_ablation_improvement_sig", help="Output directory.")
-    parser.add_argument("--save-csv", action="store_true", help="Also save CSV copies of the main tables.")
-    parser.add_argument("--p-adjust", choices=["none", "holm"], default="none", help="P-value adjustment used for significance stars in the manuscript summary table.")
+    parser.add_argument("--save-csv", action="store_true", help="Deprecated compatibility option; no extra CSV files are written.")
+    parser.add_argument("--p-adjust", choices=["bh"], default="bh", help="BH adjustment is used for significance stars in the manuscript summary table.")
     args = parser.parse_args()
 
     set_master_seed(MASTER_SEED)
@@ -530,14 +723,11 @@ def main() -> None:
                 })
 
             hosh_value = method_final_mean[FULL_METHOD]
-            hosh_blocks = method_final_blocks[FULL_METHOD]
 
             print(f"    {DISPLAY_NAMES[FULL_METHOD]} F(tc)={hosh_value:.3f}%")
             for variant in VARIANTS:
                 variant_value = method_final_mean[variant]
-                variant_blocks = method_final_blocks[variant]
                 imp = pct_improvement(hosh_value, variant_value)
-                p_block = paired_wilcoxon_pvalue(hosh_blocks, variant_blocks)
                 all_records.append({
                     "Network": net,
                     "p": ratio,
@@ -547,35 +737,56 @@ def main() -> None:
                     "HOSH_F(%)": hosh_value,
                     "Variant_F(%)": variant_value,
                     "Improvement_%": imp,
-                    "Block_Wilcoxon_p": p_block,
-                    "Block_Significance": significance_stars(p_block),
                     "Blocks": args.blocks,
                     "Repeats": args.repeats,
                 })
-                print(f"      vs {DISPLAY_NAMES.get(variant, variant):16s}: {imp:8.2f}%  p_block={p_block:.4g}")
+                print(f"      vs {DISPLAY_NAMES.get(variant, variant):16s}: {imp:8.2f}%")
 
     if not all_records:
         print("No records generated. Please check network loading and ranking files.")
         return
 
-    # Old detailed one-table format: Network × p × Variant improvement.
-    df_network_detail = build_improvement_table(all_records)
-
     # New manuscript table: average improvement over nine networks for each p and variant,
-    # with significance computed over network-level paired means.
+    # with exact significance computed over network-level paired means.
     manuscript_table, summary_long, improvement_long = build_average_improvement_summary(
         all_records, p_adjust=args.p_adjust
     )
+
+    # Keep only the three tables needed for the reviewer response.
+    # 1) Main manuscript ablation table
+    # 2) Supplementary statistical table with BH-adjusted p and r_rb
+    # 3) Supplementary raw F(tc) values for the large p=1% relative gains
+    stats_for_supp = summary_long[
+        [
+            "Variant_Display",
+            "p_label",
+            "Mean_Improvement(%)",
+            "P_for_sig",
+            "r_rb",
+        ]
+    ].copy()
+    stats_for_supp = stats_for_supp.rename(
+        columns={
+            "Variant_Display": "Variant",
+            "p_label": "Seed ratio",
+            "P_for_sig": "p",
+        }
+    )
+
+    # Final display precision only; calculations above remain unrounded.
+    stats_for_supp["Mean_Improvement(%)"] = stats_for_supp["Mean_Improvement(%)"].round(2)
+    stats_for_supp["p"] = stats_for_supp["p"].round(6)
+    stats_for_supp["r_rb"] = stats_for_supp["r_rb"].round(3)
+
+    raw_large_gain_table = build_large_gain_raw_table(detail_records)
 
     output_xlsx = os.path.join(args.output_dir, "ablation_average_improvement_significance.xlsx")
     os.makedirs(args.output_dir, exist_ok=True)
 
     with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
         manuscript_table.to_excel(writer, sheet_name="Manuscript_Table", index=False)
-        summary_long.to_excel(writer, sheet_name="Summary_Long", index=False)
-        improvement_long.to_excel(writer, sheet_name="Network_Detail_With_BlockP", index=False)
-        df_network_detail.to_excel(writer, sheet_name="Network_Improvement_Table", index=False)
-        pd.DataFrame(detail_records).to_excel(writer, sheet_name="FinalSpread_Mean_CI", index=False)
+        stats_for_supp.to_excel(writer, sheet_name="Table_Sx_Statistics", index=False)
+        raw_large_gain_table.to_excel(writer, sheet_name="Table_Sy_RawValues", index=False)
 
         # Basic formatting.
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -601,14 +812,6 @@ def main() -> None:
                 ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 32)
             ws.freeze_panes = "B2"
             ws.sheet_view.showGridLines = False
-
-    if args.save_csv:
-        manuscript_csv = os.path.join(args.output_dir, "ablation_average_improvement_significance.csv")
-        summary_csv = os.path.join(args.output_dir, "ablation_average_improvement_summary_long.csv")
-        manuscript_table.to_csv(manuscript_csv, index=False, encoding="utf-8-sig")
-        summary_long.to_csv(summary_csv, index=False, encoding="utf-8-sig")
-        print(f"CSV saved to: {manuscript_csv}")
-        print(f"CSV saved to: {summary_csv}")
 
     print("\n" + "=" * 72)
     print("Done.")

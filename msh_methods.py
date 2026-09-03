@@ -432,10 +432,26 @@ def calculate_snc(g):
 
 
 def calculate_voterank(g):
+    """VoteRank baseline with deterministic internal tie-breaking.
+
+    The voting update follows the standard VoteRank procedure used in the
+    revision: initial voting ability is 1, the neighbor decrement is
+    ``1 / <k>``, and the selected node's voting ability is set to 0.
+
+    Reproducibility rule
+    --------------------
+    If multiple candidates have the same voting score at an iterative
+    selection step, the node with the smallest node ID is selected. The
+    empirical preprocessing pipeline relabels nodes to consecutive integers,
+    so this implements the ascending-node-ID rule reported in Supplementary
+    Table S3.
+    """
     N = g.number_of_nodes()
     scores = {n: 0.0 for n in g.nodes()}
-    if N == 0: return scores
-    avg_degree = sum(dict(g.degree()).values()) / N if N > 0 else 0
+    if N == 0:
+        return scores
+
+    avg_degree = sum(dict(g.degree()).values()) / N if N > 0 else 0.0
     f = 1.0 / avg_degree if avg_degree > 0 else 0.0
     voting_ability = {n: 1.0 for n in g.nodes()}
     candidates = set(g.nodes())
@@ -447,9 +463,13 @@ def calculate_voterank(g):
         max_score = -1.0
         for node in candidates:
             current_score = sum(voting_ability[neighbor] for neighbor in neighbors_map[node])
-            if current_score > max_score:
+            if (
+                current_score > max_score
+                or (current_score == max_score and (best_node is None or node < best_node))
+            ):
                 max_score = current_score
                 best_node = node
+
         scores[best_node] = float(N - rank)
         rank += 1
         candidates.remove(best_node)
@@ -457,6 +477,7 @@ def calculate_voterank(g):
         for neighbor in neighbors_map[best_node]:
             if voting_ability[neighbor] > 0:
                 voting_ability[neighbor] = max(0.0, voting_ability[neighbor] - f)
+
     return scores
 
 

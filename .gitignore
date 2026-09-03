@@ -18,3 +18,7 @@ results/**/*.txt
 .DS_Store
 .vscode/
 .idea/
+.pytest_cache/
+coverage.xml
+htmlcov/
+*.log

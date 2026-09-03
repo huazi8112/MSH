@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the associated manuscript and the archived software release."
+title: "Mesoscopic Structural Holes for Redundancy-Aware Node Ranking in Complex Networks"
+type: software
+authors:
+  - family-names: Sun
+    given-names: Peiyao
+  - family-names: Zhang
+    given-names: Jingwen
+  - family-names: Long
+    given-names: Wenxing
+  - family-names: Wang
+    given-names: Haohua
+repository-code: "https://github.com/huazi8112/MSH"
+license: MIT

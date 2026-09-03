@@ -1,50 +1,177 @@
 {
-  "repository_version": "MSH-revision-2026-07-08",
+  "repository_version": "MSH-second-revision-draft-2026-09-04",
+  "manuscript_title": "Mesoscopic Structural Holes for Redundancy-Aware Node Ranking in Complex Networks",
   "manuscript_method_name": "MSH",
   "internal_legacy_prefix": "HOSH",
-  "note_on_internal_prefix": "Some scripts/caches retain the legacy HOSH method identifier for backward compatibility; public labels in figures and tables are MSH.",
-  "networks": ["lesmis", "adjnoun", "jazz", "usair", "infect", "email", "polblogs", "hamster", "power"],
+  "networks": [
+    "lesmis",
+    "adjnoun",
+    "jazz",
+    "usair",
+    "infect",
+    "email",
+    "polblogs",
+    "hamster",
+    "power"
+  ],
   "preprocessing": {
     "graph_type": "simple_unweighted_undirected_lcc",
     "directed_edges": "symmetrized to undirected edges",
-    "weights_or_repeated_interactions": "aggregated to a single unweighted edge",
-    "temporal_interactions": "aggregated to a static unweighted graph",
+    "repeated_or_temporal_interactions": "aggregated to one static unweighted edge",
     "self_loops": "removed",
-    "component_rule": "largest connected component extracted",
-    "node_labels": "relabel to consecutive integers starting from 0"
+    "component_rule": "largest connected component",
+    "node_labels": "consecutive integers starting at 0"
+  },
+  "msh": {
+    "xi": 0.001,
+    "public_priority_direction": "larger priority score = higher ranking priority",
+    "constraint_relation": "priority score = 1 - MSH constraint C_i",
+    "empirical_clique_backend_in_uploaded_code": "python-igraph Graph.maximal_cliques() for empirical ranking/cache generation; msh_methods.py falls back to NetworkX find_cliques() if igraph is unavailable; synthetic density/clustering stress scripts use NetworkX exact enumeration by default",
+    "manuscript_backend_wording_status": "RESOLVED: describe exact maximal-clique enumeration and document the concrete backend in the repository"
+  },
+  "baseline_settings": {
+    "CI_shell_radius": 2,
+    "VoteRank_initial_voting_ability": 1.0,
+    "VoteRank_neighbor_decrement": "1 / network mean degree <k>",
+    "VoteRank_selected_node_voting_ability": 0.0,
+    "SNIM_minimum_maximal_clique_size": 3,
+    "CHBC_community_algorithm": "Louvain (python-louvain best_partition)",
+    "CHBC_resolution": 1.0,
+    "CHBC_random_seed": 42,
+    "VoteRank_internal_tie_breaking": "ascending node ID at every iterative selection step when voting scores tie"
   },
   "sir_main": {
-    "model": "discrete stochastic network SIR",
-    "update": "synchronous; infection attempts first, then recovery; newly infected nodes become infectious in the next step",
-    "beta_main": "2.5 * beta_th",
-    "gamma_main": 1.0,
-    "seed_ratios_main": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10],
+    "model": "discrete synchronous network SIR",
+    "update_order": "infection attempts first, then recovery; newly infected nodes spread from the next step",
+    "gamma": 1.0,
+    "beta": "2.5 * beta_th",
+    "beta_th": "<k>/(<k^2>-<k>)",
+    "seed_ratios_percent": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
     "temporal_seed_count": 10,
-    "sir_repetitions": 1000,
-    "random_seed_blocks": 50,
-    "simulations_per_block": 20,
-    "confidence_interval": "95% CI",
-    "paired_test": "paired Wilcoxon signed-rank test",
-    "multiple_testing": "Benjamini-Hochberg correction",
-    "significance_threshold": 0.05
+    "blocks": 50,
+    "repeats_per_block": 20,
+    "statistical_unit": "one block mean (20 SIR realizations)",
+    "confidence_interval": "two-sided 95% Student-t CI over block means",
+    "paired_test": "paired Wilcoxon signed-rank",
+    "effect_size": "matched-pairs rank-biserial correlation"
   },
-  "robustness": {
-    "beta_values": [0.10, 0.12, 0.14, 0.16, 0.18, 0.20],
-    "recovery_gamma_values": [0.5, 0.75, 1.0],
-    "recovery_experiment_seed_ratio": 0.05
+  "beta_robustness": {
+    "seed_ratio": 0.05,
+    "beta_values": [
+      0.1,
+      0.125,
+      0.15,
+      0.175,
+      0.2
+    ],
+    "gamma": 1.0,
+    "blocks": 50,
+    "repeats_per_block": 20
+  },
+  "recovery_robustness": {
+    "seed_ratio": 0.05,
+    "gamma_values": [
+      0.5,
+      0.75,
+      1.0
+    ],
+    "target_transmissibility": "2.5 * beta_th",
+    "script_status": "CONFIRMED: current Table S5 uses the first-revision recovery-robustness script/protocol, retained as exp16_recovery_rate_tableS5.py"
   },
   "tie_breaking": {
-    "main_rule": "ascending node ID after relabeling for tied scores",
-    "sensitivity_rules": ["deterministic node-ID", "repeated random boundary tie-breaking", "SIR-based boundary tie-breaking"],
-    "monotonicity_rule": "no ID tie-breaking; identical scores are treated as tied groups"
+    "main_seed_selection": "descending score; ties resolved by ascending node ID after relabeling",
+    "main_ranking_helper_round_decimals": 8,
+    "monotonicity": "no ID tie-breaking; score groups retained as ties",
+    "kendall_tau_b": "raw method scores; no ID tie-breaking",
+    "sensitivity_strategies": [
+      "deterministic node-ID",
+      "repeated random boundary tie-breaking",
+      "SIR-based boundary tie-breaking"
+    ]
   },
-  "synthetic_runtime": {
-    "network_models": ["ER", "WS", "BA"],
-    "scale_test_nodes": [1000, 2000, 5000, 10000, 15000, 20000],
-    "scale_test_average_degree": 6,
-    "average_degree_stress_nodes": 5000,
-    "average_degree_values": [4, 8, 12, 16, 20, 24],
-    "independent_instances_per_setting": 5,
-    "memory_profiling": "not included; efficiency claims are restricted to runtime behavior"
+  "matched_controls": {
+    "degree_quantile_bins": 10,
+    "initial_unique_candidates": 1000,
+    "DMR_evaluated_sets": 10,
+    "DMD_rule": "single candidate with maximum L_s from initial candidate pool",
+    "DDMR_relative_Ls_caliper": 0.05,
+    "DDMR_target_valid_sets": 10,
+    "DDMR_max_unique_candidates": 10000,
+    "DDMR_batch_size": 1000,
+    "DDMR_no_out_of_caliper_fallback": true,
+    "max_exact_unordered_pairs": 6000,
+    "sampled_pairs_for_large_sets": 6000,
+    "valid_DDMR_settings_reference": "79/90",
+    "MSH_higher_F_counts_reference": {
+      "DMR": "85/90",
+      "DMD": "75/90",
+      "DDMR": "74/79"
+    }
+  },
+  "ablation": {
+    "seed_ratios": [
+      0.01,
+      0.05,
+      0.1
+    ],
+    "variants_public": [
+      "MSH-NO",
+      "MSH-NE",
+      "MSH-E",
+      "MSH-C",
+      "MSH-Lin",
+      "MSH-BoxCox",
+      "MSH-SumNorm"
+    ],
+    "BH_family": "seven MSH-vs-variant tests separately within each seed ratio"
+  },
+  "runtime": {
+    "scale_models": [
+      "ER",
+      "WS",
+      "BA"
+    ],
+    "scale_sizes": [
+      1000,
+      2000,
+      5000,
+      10000,
+      20000
+    ],
+    "scale_average_degree": 6,
+    "independent_instances": 5,
+    "average_degree_stress_N": 5000,
+    "average_degree_values": [
+      4,
+      8,
+      12,
+      16,
+      20,
+      24
+    ],
+    "average_degree_stress_backend_default": "networkx",
+    "clustering_stress_N": 5000,
+    "clustering_stress_average_degree": 6,
+    "clustering_rewiring_probabilities": [
+      1.0,
+      0.7,
+      0.5,
+      0.3,
+      0.1,
+      0.05,
+      0.01
+    ],
+    "clustering_stress_backend_default": "networkx"
   }
 }

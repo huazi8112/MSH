@@ -1,0 +1,10 @@
+Network,N,Legacy_tied_selection_steps,Full_order_identical,Top10_set_identical,Top1pct_set_difference_count,Top2pct_set_difference_count,Top3pct_set_difference_count,Top4pct_set_difference_count,Top5pct_set_difference_count,Top6pct_set_difference_count,Top7pct_set_difference_count,Top8pct_set_difference_count,Top9pct_set_difference_count,Top10pct_set_difference_count
+lesmis,77,55,True,True,0,0,0,0,0,0,0,0,0,0
+adjnoun,112,64,True,True,0,0,0,0,0,0,0,0,0,0
+jazz,198,55,True,True,0,0,0,0,0,0,0,0,0,0
+usair,332,242,True,True,0,0,0,0,0,0,0,0,0,0
+infect,410,188,True,True,0,0,0,0,0,0,0,0,0,0
+email,1133,809,True,True,0,0,0,0,0,0,0,0,0,0
+polblogs,1222,766,True,True,0,0,0,0,0,0,0,0,0,0
+hamster,2000,1482,True,True,0,0,0,0,0,0,0,0,0,0
+power,4941,4869,True,True,0,0,0,0,0,0,0,0,0,0

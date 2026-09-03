@@ -1,10 +1,15 @@
-Repository package: MSH-revision-2026-07-08
-Prepared for manuscript revision: Finding Influential Nodes via Clique-Aware Mesoscopic Structural Holes in Complex Networks
+Repository: MSH second-round revision
+Manuscript: Mesoscopic Structural Holes for Redundancy-Aware Node Ranking in Complex Networks
+Release-candidate prepared: 2026-09-04
 
-Final GitHub commit hash for submission: <fill in after uploading/pushing this cleaned repository>
-Release tag suggested: v2.0-revision
+Scientific/code-alignment status: RESOLVED
+- Recovery-rate Table S5 workflow confirmed.
+- Exact maximal-clique backend documented by workflow.
+- VoteRank internal ties explicitly resolved by ascending node ID; nine-network migration audit shows unchanged rankings.
 
-Notes:
-- Public method name: MSH.
-- Legacy internal identifier HOSH is retained in some scripts/caches only for backward compatibility.
-- Separate peak-memory profiling is not included; efficiency claims are restricted to runtime behavior.
+FINAL_GIT_COMMIT: <fill after final GitHub code freeze>
+GITHUB_RELEASE_TAG: <fill after release>
+ARCHIVE_DOI: <fill after Zenodo/archive>
+RELEASE_DATE: <fill after release>
+
+Do not submit the manuscript with these immutable-release placeholders. The final manuscript Availability statement should cite the archived release and/or exact Git commit.

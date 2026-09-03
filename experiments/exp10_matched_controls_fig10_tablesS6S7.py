@@ -45,6 +45,9 @@ Default parameters
   beta = 2.5 * beta_th
   beta_th = <k> / (<k^2> - <k>) by default
   50 blocks x 20 repeats for SIR evaluation
+  DMR = 10 random degree-matched sets
+  DMD = 1 maximum-dispersion set from the 1000-candidate pool
+  DDMR = target 10 random valid sets within a 5% L_s caliper; if only 1-9 valid sets exist after the maximum search, all are used
 
 Run
 ---
@@ -71,7 +74,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from scipy.stats import t
+from scipy.stats import t, wilcoxon, rankdata
 from tqdm import tqdm
 
 from hosh_methods import get_node_scores
@@ -293,6 +296,162 @@ def evaluate_seed_set_blocks(g, seeds, beta, gamma, seed_matrix, num_blocks, rep
 
 
 # =========================================================
+# 2.1 Paired statistics for matched-control comparisons
+# =========================================================
+def mean_ci95(values):
+    """Return mean and two-sided 95% t-CI half width."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan, np.nan
+    mean_val = float(np.mean(values))
+    if len(values) <= 1:
+        return mean_val, 0.0
+    sd = float(np.std(values, ddof=1))
+    ci95 = float(
+        t.ppf(0.975, df=len(values) - 1)
+        * sd / math.sqrt(len(values))
+    )
+    return mean_val, ci95
+
+
+def exact_signed_rank_pvalue_from_differences(d):
+    """
+    Exact two-sided signed-rank p-value by exhaustive sign enumeration.
+    Used only when the number of non-zero paired differences is small.
+    """
+    d = np.asarray(d, dtype=float)
+    d = d[np.isfinite(d)]
+    d = d[d != 0]
+
+    if len(d) == 0:
+        return 1.0
+
+    ranks = rankdata(np.abs(d), method='average')
+    w_plus_obs = float(np.sum(ranks[d > 0]))
+    rank_sum = float(np.sum(ranks))
+    center = rank_sum / 2.0
+    obs_distance = abs(w_plus_obs - center)
+
+    n = len(d)
+    total = 1 << n
+    extreme = 0
+
+    for bits in range(total):
+        w_plus = 0.0
+        for i in range(n):
+            if (bits >> i) & 1:
+                w_plus += ranks[i]
+        if abs(w_plus - center) >= obs_distance - 1e-12:
+            extreme += 1
+
+    return float(extreme / total)
+
+
+def paired_wilcoxon_pvalue(x, y):
+    """
+    Two-sided paired Wilcoxon signed-rank test.
+
+    Statistical unit here is one Monte Carlo block. For the default setting
+    there are 50 paired block-level observations. If many zero differences
+    reduce the effective sample size to <=20, exact sign enumeration is used;
+    otherwise SciPy's normal approximation is used explicitly.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    d = x[mask] - y[mask]
+    d_nonzero = d[d != 0]
+
+    if len(d_nonzero) == 0:
+        return 1.0
+
+    if len(d_nonzero) <= 20:
+        return exact_signed_rank_pvalue_from_differences(d_nonzero)
+
+    return float(
+        wilcoxon(
+            d_nonzero,
+            zero_method='wilcox',
+            correction=False,
+            alternative='two-sided',
+            method='approx',
+        ).pvalue
+    )
+
+
+def matched_pairs_rank_biserial(x, y):
+    """
+    Matched-pairs rank-biserial correlation:
+        r_rb = (W+ - W-) / (W+ + W-)
+
+    x = MSH block-level values
+    y = control-strategy block-level values
+
+    Positive r_rb favors MSH.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    d = x[mask] - y[mask]
+    d = d[d != 0]
+
+    if len(d) == 0:
+        return 0.0
+
+    ranks = rankdata(np.abs(d), method='average')
+    w_plus = float(np.sum(ranks[d > 0]))
+    w_minus = float(np.sum(ranks[d < 0]))
+    denom = w_plus + w_minus
+
+    if denom == 0:
+        return 0.0
+
+    return float((w_plus - w_minus) / denom)
+
+
+def bh_adjust(p_values):
+    """Benjamini-Hochberg adjusted p-values; NaNs are preserved."""
+    p = np.asarray(p_values, dtype=float)
+    adjusted = np.full(len(p), np.nan, dtype=float)
+
+    valid = np.where(np.isfinite(p))[0]
+    if len(valid) == 0:
+        return adjusted
+
+    order = valid[np.argsort(p[valid])]
+    ordered_p = p[order]
+    m = len(order)
+
+    adj = ordered_p * m / np.arange(1, m + 1)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    adj = np.clip(adj, 0.0, 1.0)
+
+    adjusted[order] = adj
+    return adjusted
+
+
+def apply_bh_by_control(df):
+    """
+    For each network and each control strategy separately, correct the
+    paired-Wilcoxon p-values across the available seed-ratio settings.
+    With complete data this is a family of 10 tests (p=1%,...,10%).
+    """
+    df = df.copy()
+    df['P_BH'] = np.nan
+
+    for control, sub in df.groupby('Control'):
+        idx = sub.index.to_numpy()
+        df.loc[idx, 'P_BH'] = bh_adjust(
+            sub['Paired_Wilcoxon_P_raw'].to_numpy(dtype=float)
+        )
+
+    return df
+
+
+# =========================================================
 # 3. Degree-matched control generation
 # =========================================================
 def build_degree_quantile_bins(g, num_bins=10):
@@ -423,78 +582,142 @@ def add_ls_error_to_info(info, ls_proposed):
 def select_ddmr_with_caliper(g, proposed_seeds, node_to_bin, bin_to_nodes,
                              initial_cand_info, ls_proposed, dist_calc, rng, args):
     """
-    Select DDMR controls using a strict L_s caliper.
+    Degree-and-distance-matched random controls (DDMR).
 
-    DDMR candidates must satisfy:
-        |L_s(control) - L_s(MSH)| / L_s(MSH) <= args.ddmr_caliper
+    Matching requirement
+    --------------------
+        |L_s(C) - L_s(MSH)| / L_s(MSH) <= args.ddmr_caliper
 
-    The function adaptively generates additional degree-matched candidates until
-    at least args.ddmr_min_matches candidates satisfy the caliper, or until
-    args.ddmr_max_candidates unique candidates have been evaluated.
+    Final reviewer-oriented rule
+    ----------------------------
+    1. Start from the initial degree-matched candidate pool.
+    2. If fewer than `ddmr_target_sets` valid matches are available,
+       continue generating UNIQUE degree-matched candidates up to
+       `ddmr_max_candidates`.
+    3. If >= target valid matches are found, randomly sample exactly
+       `ddmr_target_sets` valid controls.
+    4. If only 1...(target-1) valid matches exist after the maximum
+       search, evaluate ALL of those valid controls rather than deleting
+       the whole setting.
+    5. If zero valid matches exist, mark the setting as unmatched and
+       omit only that DDMR point.
+    6. No out-of-caliper fallback is ever used.
 
-    If no candidate satisfies the caliper and --allow-ddmr-fallback is not set,
-    no DDMR row is produced for that network-ratio setting. This avoids falsely
-    labeling a poorly matched control as distance-matched.
+    This keeps every reported DDMR control strictly within the stated
+    L_s tolerance while transparently reporting the actual number of
+    valid and evaluated controls.
     """
-    ddmr_pool = [add_ls_error_to_info(x, ls_proposed) for x in initial_cand_info]
-    seen = {canonical_seed_tuple(x['seeds']) for x in ddmr_pool}
+    ddmr_pool = [
+        add_ls_error_to_info(x, ls_proposed)
+        for x in initial_cand_info
+    ]
 
-    def within_caliper(pool):
-        return sorted(
-            [x for x in pool if x['Rel_Ls_Error'] <= args.ddmr_caliper],
-            key=lambda x: (x['Rel_Ls_Error'], x['Abs_Ls_Error'])
-        )
+    seen = {
+        canonical_seed_tuple(x["seeds"])
+        for x in ddmr_pool
+    }
 
-    matched = within_caliper(ddmr_pool)
+    def valid_matches(pool):
+        return [
+            x for x in pool
+            if x["Rel_Ls_Error"] <= args.ddmr_caliper
+        ]
+
+    matched = valid_matches(ddmr_pool)
     total_evaluated = len(ddmr_pool)
 
-    while (len(matched) < args.ddmr_min_matches and
-           total_evaluated < args.ddmr_max_candidates):
-        need_capacity = args.ddmr_max_candidates - total_evaluated
-        batch_size = min(args.ddmr_batch_size, need_capacity)
+    target = int(args.ddmr_target_sets)
+
+    while (
+        len(matched) < target
+        and total_evaluated < args.ddmr_max_candidates
+    ):
+        remaining = args.ddmr_max_candidates - total_evaluated
+        batch_size = min(args.ddmr_batch_size, remaining)
+
         if batch_size <= 0:
             break
 
         new_candidates, seen = generate_degree_matched_candidates_incremental(
-            g, proposed_seeds, node_to_bin, bin_to_nodes,
-            num_new=batch_size, rng=rng, seen=seen
+            g,
+            proposed_seeds,
+            node_to_bin,
+            bin_to_nodes,
+            num_new=batch_size,
+            rng=rng,
+            seen=seen,
         )
+
         if not new_candidates:
             break
 
         for cand in new_candidates:
             ls = dist_calc.average_distance(cand)
-            ddmr_pool.append(add_ls_error_to_info({'seeds': cand, 'Ls': ls}, ls_proposed))
+            ddmr_pool.append(
+                add_ls_error_to_info(
+                    {"seeds": cand, "Ls": ls},
+                    ls_proposed,
+                )
+            )
+
         total_evaluated = len(ddmr_pool)
-        matched = within_caliper(ddmr_pool)
+        matched = valid_matches(ddmr_pool)
 
-    if matched:
-        selected = matched[:min(args.ddmr_nearest, len(matched))]
-        status = 'within_caliper'
+    # Final selection rule.
+    if len(matched) >= target:
+        selected = rng.sample(matched, target)
+        status = "matched_target_reached"
+    elif len(matched) > 0:
+        selected = list(matched)
+        status = "matched_partial_use_all_valid"
     else:
-        closest = sorted(ddmr_pool, key=lambda x: (x['Rel_Ls_Error'], x['Abs_Ls_Error']))
-        if args.allow_ddmr_fallback and closest:
-            selected = closest[:min(args.ddmr_nearest, len(closest))]
-            status = 'fallback_closest_not_within_caliper'
-        else:
-            selected = []
-            status = 'unmatched_no_ddmr_row'
+        selected = []
+        status = "unmatched_no_valid_control"
 
-    best_rel_error = min((x['Rel_Ls_Error'] for x in ddmr_pool), default=np.nan)
-    selected_mean_ls = float(np.mean([x['Ls'] for x in selected])) if selected else np.nan
-    selected_rel_error = relative_ls_error(selected_mean_ls, ls_proposed) if selected else np.nan
+    best_rel_error = min(
+        (x["Rel_Ls_Error"] for x in ddmr_pool),
+        default=np.nan,
+    )
+
+    selected_rel_errors = [
+        x["Rel_Ls_Error"]
+        for x in selected
+    ]
+
+    selected_mean_rel_error = (
+        float(np.mean(selected_rel_errors))
+        if selected_rel_errors else np.nan
+    )
+
+    selected_max_rel_error = (
+        float(np.max(selected_rel_errors))
+        if selected_rel_errors else np.nan
+    )
+
+    acceptance_rate = (
+        len(matched) / total_evaluated * 100.0
+        if total_evaluated > 0 else np.nan
+    )
 
     meta = {
-        'DDMR_Caliper': args.ddmr_caliper,
-        'DDMR_Caliper(%)': args.ddmr_caliper * 100.0,
-        'DDMR_Status': status,
-        'DDMR_Total_Candidates_Evaluated': total_evaluated,
-        'DDMR_Candidates_Within_Caliper': len(matched),
-        'DDMR_Selected_Count': len(selected),
-        'DDMR_Best_Relative_Ls_Error(%)': best_rel_error * 100.0 if np.isfinite(best_rel_error) else np.nan,
-        'DDMR_Selected_Mean_Relative_Ls_Error(%)': selected_rel_error * 100.0 if np.isfinite(selected_rel_error) else np.nan,
-        'DDMR_Selected_Within_5pct': bool(selected and selected_rel_error <= args.ddmr_caliper),
+        "DDMR_Caliper(%)": args.ddmr_caliper * 100.0,
+        "DDMR_Target_Sets": target,
+        "DDMR_Status": status,
+        "DDMR_Total_Candidates_Evaluated": total_evaluated,
+        "DDMR_Candidates_Within_Caliper": len(matched),
+        "DDMR_Acceptance_Rate(%)": acceptance_rate,
+        "DDMR_Selected_Count": len(selected),
+        "DDMR_Best_Relative_Ls_Error(%)":
+            best_rel_error * 100.0
+            if np.isfinite(best_rel_error) else np.nan,
+        "DDMR_Selected_Mean_Relative_Ls_Error(%)":
+            selected_mean_rel_error * 100.0
+            if np.isfinite(selected_mean_rel_error) else np.nan,
+        "DDMR_Selected_Max_Relative_Ls_Error(%)":
+            selected_max_rel_error * 100.0
+            if np.isfinite(selected_max_rel_error) else np.nan,
     }
+
     return selected, meta
 
 
@@ -588,11 +811,15 @@ def process_one_network(net, args, output_dir):
     print(f"  Nodes: {n}, Edges: {m}")
 
     proposed_ranked = get_proposed_ranking(
-        g, net,
+        g,
+        net,
         proposed_method=args.proposed_method,
         disable_precomputed=args.disable_precomputed,
     )
-    proposed_ranked = [v for v in proposed_ranked if g.has_node(v)]
+    proposed_ranked = [
+        v for v in proposed_ranked
+        if g.has_node(v)
+    ]
 
     beta_th, beta, k_mean, k2_mean = compute_beta(
         g,
@@ -601,9 +828,18 @@ def process_one_network(net, args, output_dir):
         use_gamma_scaled_threshold=args.use_gamma_scaled_threshold,
         cap_beta=not args.no_cap_beta,
     )
-    print(f"  SIR: gamma={args.gamma:.3f}, beta_th={beta_th:.6f}, beta={beta:.6f}, lambda={args.threshold_multiplier:.2f}")
 
-    node_to_bin, bin_to_nodes = build_degree_quantile_bins(g, num_bins=args.degree_bins)
+    print(
+        f"  SIR: gamma={args.gamma:.3f}, "
+        f"beta_th={beta_th:.6f}, beta={beta:.6f}, "
+        f"lambda={args.threshold_multiplier:.2f}"
+    )
+
+    node_to_bin, bin_to_nodes = build_degree_quantile_bins(
+        g,
+        num_bins=args.degree_bins
+    )
+
     dist_calc = DistanceCalculator(
         g,
         max_exact_pairs=args.max_exact_pairs,
@@ -613,15 +849,30 @@ def process_one_network(net, args, output_dir):
 
     records = []
 
-    for ratio_pct in tqdm(range(1, 11), desc=f"  Ratios for {net}"):
+    for ratio_pct in tqdm(
+        range(1, 11),
+        desc=f"  Ratios for {net}"
+    ):
         ratio = ratio_pct / 100.0
         k = max(2, int(math.ceil(n * ratio)))
         k = min(k, n)
 
         proposed_seeds = proposed_ranked[:k]
-        ls_proposed = dist_calc.average_distance(proposed_seeds)
+        ls_proposed = dist_calc.average_distance(
+            proposed_seeds
+        )
 
-        control_rng = random.Random(args.master_seed + stable_int_hash(f'{net}_{ratio_pct}', 1000000))
+        # -------------------------------------------------
+        # Initial degree-matched candidate pool
+        # -------------------------------------------------
+        control_rng = random.Random(
+            args.master_seed
+            + stable_int_hash(
+                f'{net}_{ratio_pct}',
+                1000000
+            )
+        )
+
         candidates = generate_degree_matched_candidates(
             g,
             proposed_seeds,
@@ -630,29 +881,54 @@ def process_one_network(net, args, output_dir):
             num_candidates=args.control_trials,
             rng=control_rng,
         )
+
         if not candidates:
-            print(f"    [Skip] {net} p={ratio_pct}%: no control candidates")
+            print(
+                f"    [Skip] {net} p={ratio_pct}%: "
+                f"no degree-matched candidates"
+            )
             continue
 
-        # Compute L_s for all candidate controls once.
         cand_info = []
+
         for cand in candidates:
-            ls = dist_calc.average_distance(cand)
-            cand_info.append({'seeds': cand, 'Ls': ls})
+            cand_info.append({
+                'seeds': cand,
+                'Ls': dist_calc.average_distance(cand),
+            })
 
-        # DMR: average over the first / randomly shuffled dmr_eval_sets controls.
-        # DMR is intentionally based only on the initial candidate pool.
-        control_rng.shuffle(cand_info)
-        dmr_infos = cand_info[:min(args.dmr_eval_sets, len(cand_info))]
+        initial_candidate_count = len(cand_info)
 
-        # DMD: candidate with maximum dispersion.
-        # DMD is intentionally based only on the initial candidate pool, so it is
-        # unchanged by the adaptive DDMR caliper search.
-        dmd_info = max(cand_info, key=lambda x: x['Ls'])
+        # -------------------------------------------------
+        # DMR: 10 randomly selected unique degree-matched sets
+        # -------------------------------------------------
+        dmr_pool = list(cand_info)
+        control_rng.shuffle(dmr_pool)
+        dmr_infos = dmr_pool[
+            :min(
+                args.dmr_eval_sets,
+                len(dmr_pool)
+            )
+        ]
 
-        # DDMR: strict degree-and-distance matched controls.
-        # Only candidates with relative L_s error <= args.ddmr_caliper are used.
-        ddmr_rng = random.Random(args.master_seed + 777777 + ratio_pct * 100000 + stable_int_hash(net, 10000))
+        # -------------------------------------------------
+        # DMD: single maximum-dispersion set from same pool
+        # -------------------------------------------------
+        dmd_info = max(
+            cand_info,
+            key=lambda x: x['Ls']
+        )
+
+        # -------------------------------------------------
+        # DDMR: target 10 random valid controls within 5%
+        # -------------------------------------------------
+        ddmr_rng = random.Random(
+            args.master_seed
+            + 777777
+            + ratio_pct * 100000
+            + stable_int_hash(net, 10000)
+        )
+
         ddmr_infos, ddmr_meta = select_ddmr_with_caliper(
             g,
             proposed_seeds,
@@ -665,63 +941,96 @@ def process_one_network(net, args, output_dir):
             args=args,
         )
 
-        # Shared SIR random seeds across MSH and all controls under the same network-ratio setting.
+        # -------------------------------------------------
+        # Common random-number schedule
+        # -------------------------------------------------
         seed_matrix = make_seed_matrix(
             args.blocks,
             args.repeats,
-            base_seed=args.master_seed + ratio_pct * 100000 + stable_int_hash(net, 10000),
+            base_seed=(
+                args.master_seed
+                + ratio_pct * 100000
+                + stable_int_hash(net, 10000)
+            ),
         )
 
-        f_proposed, ci_proposed, blocks_proposed = evaluate_seed_set_blocks(
-            g, proposed_seeds, beta, args.gamma, seed_matrix, args.blocks, args.repeats
+        f_proposed, ci_proposed, blocks_proposed = (
+            evaluate_seed_set_blocks(
+                g,
+                proposed_seeds,
+                beta,
+                args.gamma,
+                seed_matrix,
+                args.blocks,
+                args.repeats,
+            )
         )
 
+        # -------------------------------------------------
+        # Strategy-level evaluation
+        #
+        # For DMR/DDMR, evaluate each control set using the
+        # same block/repetition RNG schedule, then average the
+        # control sets WITHIN each block. CI and paired tests are
+        # based on the resulting 50 strategy-level block means.
+        # -------------------------------------------------
         def eval_control_group(infos):
-            f_vals = []
-            ci_vals = []
+            if not infos:
+                return None
+
             ls_vals = []
-            all_block_means = []
+            block_matrix = []
+
             for info in infos:
-                f, ci, block_means = evaluate_seed_set_blocks(
-                    g, info['seeds'], beta, args.gamma, seed_matrix, args.blocks, args.repeats
+                _, _, block_means = evaluate_seed_set_blocks(
+                    g,
+                    info['seeds'],
+                    beta,
+                    args.gamma,
+                    seed_matrix,
+                    args.blocks,
+                    args.repeats,
                 )
-                f_vals.append(f)
-                ci_vals.append(ci)
+
                 ls_vals.append(info['Ls'])
-                all_block_means.append(block_means)
+                block_matrix.append(
+                    np.asarray(block_means, dtype=float)
+                )
+
+            block_matrix = np.vstack(block_matrix)
+
+            # One strategy-level value per Monte Carlo block.
+            strategy_blocks = np.mean(
+                block_matrix,
+                axis=0
+            )
+
+            f_mean, f_ci = mean_ci95(
+                strategy_blocks
+            )
+
             return {
-                'F': float(np.mean(f_vals)) if f_vals else np.nan,
-                'CI': float(np.mean(ci_vals)) if ci_vals else np.nan,
-                'Ls': float(np.mean(ls_vals)) if ls_vals else np.nan,
-                'F_values': f_vals,
-                'BlockMeans': all_block_means,
+                'F': f_mean,
+                'CI': f_ci,
+                'Ls': float(np.mean(ls_vals)),
+                'BlockMeans': strategy_blocks,
+                'Control_Set_Count': len(infos),
             }
 
         control_results = {
             'DMR': eval_control_group(dmr_infos),
             'DMD': eval_control_group([dmd_info]),
         }
+
         if ddmr_infos:
-            control_results['DDMR'] = eval_control_group(ddmr_infos)
-        else:
-            control_results['DDMR'] = {
-                'F': np.nan,
-                'CI': np.nan,
-                'Ls': np.nan,
-                'F_values': [],
-                'BlockMeans': [],
-            }
+            control_results['DDMR'] = eval_control_group(
+                ddmr_infos
+            )
 
-        # Empirical percentile and p-value for DDMR distribution.
-        ddmr_f_values = np.asarray(control_results['DDMR']['F_values'], dtype=float)
-        if len(ddmr_f_values) > 0:
-            ddmr_percentile = float(np.mean(ddmr_f_values < f_proposed) * 100.0)
-            ddmr_emp_p = float((1 + np.sum(ddmr_f_values >= f_proposed)) / (len(ddmr_f_values) + 1))
-        else:
-            ddmr_percentile = np.nan
-            ddmr_emp_p = np.nan
-
-        # Raw proposed row.
+        # -------------------------------------------------
+        # Matching metadata: repeated in row-level figure data;
+        # later deduplicated into Supplementary Table Sx.
+        # -------------------------------------------------
         base_meta = {
             'Network': net,
             'N': n,
@@ -735,63 +1044,121 @@ def process_one_network(net, args, output_dir):
             f'{args.proposed_label}_F(%)': f_proposed,
             f'{args.proposed_label}_95CI': ci_proposed,
             f'{args.proposed_label}_Ls': ls_proposed,
-            'DDMR_Percentile(%)': ddmr_percentile,
-            'DDMR_Empirical_P': ddmr_emp_p,
+
+            'Initial_DegreeMatched_Candidates':
+                initial_candidate_count,
+            'DMR_Sets_Evaluated':
+                len(dmr_infos),
+            'DMD_Candidate_Pool_Size':
+                initial_candidate_count,
+            'DMD_Sets_Evaluated':
+                1,
         }
+
         base_meta.update(ddmr_meta)
 
+        # -------------------------------------------------
+        # Quantitative paired comparisons
+        # -------------------------------------------------
         for control_name, cres in control_results.items():
-            # Do not plot or summarize an unmatched DDMR point. This preserves the
-            # interpretation that every DDMR point satisfies the specified L_s caliper.
-            if control_name == 'DDMR' and (not ddmr_infos) and (not args.allow_ddmr_fallback):
+            if cres is None:
                 continue
+
+            control_blocks = np.asarray(
+                cres['BlockMeans'],
+                dtype=float
+            )
+
+            delta_blocks = (
+                np.asarray(blocks_proposed, dtype=float)
+                - control_blocks
+            )
+
+            delta_mean, delta_ci = mean_ci95(
+                delta_blocks
+            )
+
+            p_raw = paired_wilcoxon_pvalue(
+                blocks_proposed,
+                control_blocks,
+            )
+
+            r_rb = matched_pairs_rank_biserial(
+                blocks_proposed,
+                control_blocks,
+            )
+
             rec = dict(base_meta)
+
             rec.update({
                 'Control': control_name,
-                'Control_F(%)': cres['F'],
-                'Control_95CI': cres['CI'],
-                'Control_Ls': cres['Ls'],
-                'Delta_Ls_Control_minus_Proposed': cres['Ls'] - ls_proposed,
-                'Delta_F_Proposed_minus_Control(%)': f_proposed - cres['F'],
-                'Imp_vs_Control(%)': ((f_proposed - cres['F']) / cres['F'] * 100.0) if cres['F'] > 0 else np.nan,
+                'Control_Sets_Evaluated':
+                    cres['Control_Set_Count'],
+
+                'Control_F(%)':
+                    cres['F'],
+                'Control_95CI':
+                    cres['CI'],
+                'Control_Ls':
+                    cres['Ls'],
+
+                'Delta_Ls_Control_minus_Proposed':
+                    cres['Ls'] - ls_proposed,
+
+                'Delta_F_Proposed_minus_Control(%)':
+                    delta_mean,
+                'Delta_F_95CI':
+                    delta_ci,
+
+                'Paired_Wilcoxon_P_raw':
+                    p_raw,
+                'Rank_Biserial_r_rb':
+                    r_rb,
             })
+
             records.append(rec)
 
-        ddmr_print = (
-            f"DDMR F={control_results['DDMR']['F']:6.2f}, "
-            f"Ls={control_results['DDMR']['Ls']:5.2f}, "
-            f"err={ddmr_meta['DDMR_Selected_Mean_Relative_Ls_Error(%)']:5.2f}% "
+        # -------------------------------------------------
+        # Concise console diagnostics
+        # -------------------------------------------------
+        ddmr_msg = (
+            f"DDMR valid={ddmr_meta['DDMR_Candidates_Within_Caliper']}, "
+            f"evaluated={ddmr_meta['DDMR_Selected_Count']}, "
+            f"searched={ddmr_meta['DDMR_Total_Candidates_Evaluated']} "
             f"[{ddmr_meta['DDMR_Status']}]"
-        ) if ddmr_infos else (
-            f"DDMR unmatched, best_err={ddmr_meta['DDMR_Best_Relative_Ls_Error(%)']:5.2f}% "
-            f"after {ddmr_meta['DDMR_Total_Candidates_Evaluated']} candidates"
-        )
-        print(
-            f"    p={ratio_pct:2d}% k={k:4d} | "
-            f"{args.proposed_label} F={f_proposed:6.2f}, Ls={ls_proposed:5.2f} | "
-            f"DMD F={control_results['DMD']['F']:6.2f}, Ls={control_results['DMD']['Ls']:5.2f} | "
-            f"{ddmr_print}"
+            if ddmr_infos
+            else
+            f"DDMR unmatched: "
+            f"{ddmr_meta['DDMR_Candidates_Within_Caliper']} valid "
+            f"after {ddmr_meta['DDMR_Total_Candidates_Evaluated']} searched"
         )
 
-        # Checkpoint after each ratio.
-        if records:
-            df_ckpt = pd.DataFrame(records)
-            ckpt_path = os.path.join(output_dir, f"Opinion10_DDMR_Quadrant_{net}_checkpoint.xlsx")
-            df_ckpt.to_excel(ckpt_path, index=False)
+        print(
+            f"    p={ratio_pct:2d}% k={k:4d} | "
+            f"{args.proposed_label} F={f_proposed:6.2f}, "
+            f"Ls={ls_proposed:5.2f} | "
+            f"DMR={len(dmr_infos)} sets | "
+            f"DMD=1/{initial_candidate_count} | "
+            f"{ddmr_msg}"
+        )
 
     if not records:
         return None
 
     df_net = pd.DataFrame(records)
 
-    # Save network-level data and plot immediately.
-    xlsx_path = os.path.join(output_dir, f"Opinion10_DDMR_Quadrant_{net}.xlsx")
-    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
-        df_net.to_excel(writer, sheet_name='Quadrant_Data', index=False)
-        summarize_network(df_net, args.proposed_label).to_excel(writer, sheet_name='Summary', index=False)
-    print(f"  [Output] Data saved: {xlsx_path}")
+    # BH correction is performed separately for DMR, DMD, and DDMR
+    # across the seed-ratio comparisons within this network.
+    df_net = apply_bh_by_control(df_net)
 
-    plot_single_network_quadrant(df_net, net, args.proposed_label, output_dir, annotate=args.annotate_ratios)
+    plot_single_network_quadrant(
+        df_net,
+        net,
+        args.proposed_label,
+        output_dir,
+        annotate=args.annotate_ratios,
+    )
+
     return df_net
 
 
@@ -830,12 +1197,25 @@ def plot_single_network_quadrant(df_net, net, proposed_label, output_dir, annota
     add_zero_axes(ax)
 
     for control_name, style in CONTROL_STYLES.items():
-        sub = df_net[df_net['Control'] == control_name].sort_values('p(%)')
+        sub = (
+            df_net[df_net['Control'] == control_name]
+            .sort_values('p(%)')
+        )
+
         if sub.empty:
             continue
+
+        x = sub[
+            'Delta_Ls_Control_minus_Proposed'
+        ].to_numpy(dtype=float)
+
+        y = sub[
+            'Delta_F_Proposed_minus_Control(%)'
+        ].to_numpy(dtype=float)
+
         ax.scatter(
-            sub['Delta_Ls_Control_minus_Proposed'],
-            sub['Delta_F_Proposed_minus_Control(%)'],
+            x,
+            y,
             s=34,
             marker=style['marker'],
             facecolor=style['color'],
@@ -845,28 +1225,58 @@ def plot_single_network_quadrant(df_net, net, proposed_label, output_dir, annota
             label=style['label'],
             zorder=5,
         )
+
         if annotate:
             for _, row in sub.iterrows():
                 ax.text(
-                    row['Delta_Ls_Control_minus_Proposed'],
-                    row['Delta_F_Proposed_minus_Control(%)'],
+                    row[
+                        'Delta_Ls_Control_minus_Proposed'
+                    ],
+                    row[
+                        'Delta_F_Proposed_minus_Control(%)'
+                    ],
                     str(int(row['p(%)'])),
                     fontsize=6.5,
-                    ha='center', va='bottom',
+                    ha='center',
+                    va='bottom',
                 )
 
-    ax.set_title(format_network_name(net), fontsize=12, fontweight='bold', pad=8)
+    ax.set_title(
+        format_network_name(net),
+        fontsize=12,
+        fontweight='bold',
+        pad=8,
+    )
+
     ax.set_xlabel(r'$\Delta L_s$')
     ax.set_ylabel(r'$\Delta F(t_c)$ (pp)')
     finish_axes_style(ax)
+
     plt.tight_layout(pad=0.25)
 
-    pdf_path = os.path.join(output_dir, f"Opinion10_DDMR_Quadrant_{net}.pdf")
-    png_path = os.path.join(output_dir, f"Opinion10_DDMR_Quadrant_{net}.png")
+    pdf_path = os.path.join(
+        output_dir,
+        f"Opinion10_DDMR_Quadrant_{net}.pdf"
+    )
+    png_path = os.path.join(
+        output_dir,
+        f"Opinion10_DDMR_Quadrant_{net}.png"
+    )
+
     plt.savefig(pdf_path, format='pdf')
-    plt.savefig(png_path, dpi=600, bbox_inches='tight', facecolor='white')
+    plt.savefig(
+        png_path,
+        dpi=600,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
     plt.close()
-    print(f"  [Output] Network plot saved: {pdf_path}")
+
+    print(
+        f"  [Output] Network plot saved: "
+        f"{pdf_path}"
+    )
 
 
 def export_standalone_legend(output_dir):
@@ -907,23 +1317,54 @@ def export_standalone_legend(output_dir):
 
 def plot_9network_panel(df_all, proposed_label, output_dir, network_order=None, annotate=False):
     if network_order is None:
-        network_order = list(df_all['Network'].drop_duplicates())
+        network_order = list(
+            df_all['Network'].drop_duplicates()
+        )
 
-    # Keep at most 9 networks for the requested 3x3 panel.
     network_order = network_order[:9]
-    fig, axes = plt.subplots(3, 3, figsize=(10.5, 8.4), sharex=False, sharey=False)
+
+    fig, axes = plt.subplots(
+        3,
+        3,
+        figsize=(10.5, 8.4),
+        sharex=False,
+        sharey=False,
+    )
+
     axes = axes.flatten()
 
-    for ax, net in zip(axes, network_order):
-        sub_net = df_all[df_all['Network'] == net]
+    for ax, net in zip(
+        axes,
+        network_order
+    ):
+        sub_net = df_all[
+            df_all['Network'] == net
+        ]
+
         add_zero_axes(ax)
+
         for control_name, style in CONTROL_STYLES.items():
-            sub = sub_net[sub_net['Control'] == control_name].sort_values('p(%)')
+            sub = (
+                sub_net[
+                    sub_net['Control'] == control_name
+                ]
+                .sort_values('p(%)')
+            )
+
             if sub.empty:
                 continue
+
+            x = sub[
+                'Delta_Ls_Control_minus_Proposed'
+            ].to_numpy(dtype=float)
+
+            y = sub[
+                'Delta_F_Proposed_minus_Control(%)'
+            ].to_numpy(dtype=float)
+
             ax.scatter(
-                sub['Delta_Ls_Control_minus_Proposed'],
-                sub['Delta_F_Proposed_minus_Control(%)'],
+                x,
+                y,
                 s=24,
                 marker=style['marker'],
                 facecolor=style['color'],
@@ -932,37 +1373,63 @@ def plot_9network_panel(df_all, proposed_label, output_dir, network_order=None, 
                 alpha=0.86,
                 zorder=5,
             )
+
             if annotate:
                 for _, row in sub.iterrows():
                     ax.text(
-                        row['Delta_Ls_Control_minus_Proposed'],
-                        row['Delta_F_Proposed_minus_Control(%)'],
+                        row[
+                            'Delta_Ls_Control_minus_Proposed'
+                        ],
+                        row[
+                            'Delta_F_Proposed_minus_Control(%)'
+                        ],
                         str(int(row['p(%)'])),
                         fontsize=5.8,
-                        ha='center', va='bottom',
+                        ha='center',
+                        va='bottom',
                     )
-        ax.set_title(format_network_name(net), fontsize=12, fontweight='bold', pad=8)
+
+        ax.set_title(
+            format_network_name(net),
+            fontsize=12,
+            fontweight='bold',
+            pad=8,
+        )
+
         finish_axes_style(ax)
 
     for ax in axes[len(network_order):]:
         ax.axis('off')
 
-    fig.supxlabel(r'$\Delta L_s$', y=0.045, fontsize=11)
-    fig.supylabel(r'$\Delta F(t_c)$ (pp)', x=0.045, fontsize=11)
+    fig.supxlabel(
+        r'$\Delta L_s$',
+        y=0.045,
+        fontsize=11,
+    )
 
-    # Embedded compact legend for readability; standalone legend is also exported.
+    fig.supylabel(
+        r'$\Delta F(t_c)$ (pp)',
+        x=0.045,
+        fontsize=11,
+    )
+
     handles = []
+
     for control_name, style in CONTROL_STYLES.items():
-        handles.append(Line2D(
-            [0], [0],
-            marker=style['marker'],
-            color='none',
-            markerfacecolor=style['color'],
-            markeredgecolor='black',
-            markeredgewidth=0.6,
-            markersize=6.5,
-            label=style['label'],
-        ))
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker=style['marker'],
+                color='none',
+                markerfacecolor=style['color'],
+                markeredgecolor='black',
+                markeredgewidth=0.6,
+                markersize=6.5,
+                label=style['label'],
+            )
+        )
+
     fig.legend(
         handles=handles,
         loc='upper center',
@@ -975,50 +1442,190 @@ def plot_9network_panel(df_all, proposed_label, output_dir, network_order=None, 
         fontsize=9,
     )
 
-    plt.tight_layout(rect=[0.06, 0.06, 1.0, 0.955])
-    pdf_path = os.path.join(output_dir, "Opinion10_DDMR_Quadrant_9Networks.pdf")
-    png_path = os.path.join(output_dir, "Opinion10_DDMR_Quadrant_9Networks.png")
+    plt.tight_layout(
+        rect=[0.06, 0.06, 1.0, 0.955]
+    )
+
+    pdf_path = os.path.join(
+        output_dir,
+        "Opinion10_DDMR_Quadrant_9Networks.pdf"
+    )
+
+    png_path = os.path.join(
+        output_dir,
+        "Opinion10_DDMR_Quadrant_9Networks.png"
+    )
+
     plt.savefig(pdf_path, format='pdf')
-    plt.savefig(png_path, dpi=600, bbox_inches='tight', facecolor='white')
+    plt.savefig(
+        png_path,
+        dpi=600,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
     plt.close()
-    print(f"[Output] 9-network panel saved: {pdf_path}")
+
+    print(
+        f"[Output] 9-network panel saved: "
+        f"{pdf_path}"
+    )
 
 
 def save_all_results(df_all, output_dir, proposed_label):
-    data_path = os.path.join(output_dir, "Opinion10_DDMR_Quadrant_Data.xlsx")
-    summary_control = []
-    for control, sub in df_all.groupby('Control'):
-        summary_control.append({
-            'Control': control,
-            'Mean_Delta_Ls': sub['Delta_Ls_Control_minus_Proposed'].mean(),
-            'Mean_Delta_F(%)': sub['Delta_F_Proposed_minus_Control(%)'].mean(),
-            'Mean_Imp_vs_Control(%)': sub['Imp_vs_Control(%)'].mean(),
-            'Cases_Control_More_Dispersed(%)': (sub['Delta_Ls_Control_minus_Proposed'] > 0).mean() * 100.0,
-            f'Cases_{proposed_label}_Higher_F(%)': (sub['Delta_F_Proposed_minus_Control(%)'] > 0).mean() * 100.0,
-            'Upper_Right_Cases(%)': ((sub['Delta_Ls_Control_minus_Proposed'] > 0) & (sub['Delta_F_Proposed_minus_Control(%)'] > 0)).mean() * 100.0,
-        })
-    summary_control = pd.DataFrame(summary_control)
+    """
+    Save only reviewer-relevant outputs:
 
-    summary_by_p = []
-    for (p, control), sub in df_all.groupby(['p(%)', 'Control']):
-        summary_by_p.append({
-            'p(%)': p,
-            'Control': control,
-            f'Mean_{proposed_label}_F(%)': sub[f'{proposed_label}_F(%)'].mean(),
-            'Mean_Control_F(%)': sub['Control_F(%)'].mean(),
-            f'Mean_{proposed_label}_Ls': sub[f'{proposed_label}_Ls'].mean(),
-            'Mean_Control_Ls': sub['Control_Ls'].mean(),
-            'Mean_Delta_Ls': sub['Delta_Ls_Control_minus_Proposed'].mean(),
-            'Mean_Delta_F(%)': sub['Delta_F_Proposed_minus_Control(%)'].mean(),
-            'Mean_Imp_vs_Control(%)': sub['Imp_vs_Control(%)'].mean(),
-        })
-    summary_by_p = pd.DataFrame(summary_by_p).sort_values(['p(%)', 'Control'])
+    Figure_Data
+        One row = one seed ratio × one control strategy.
+        Contains the coordinates used in Fig. 9; paired uncertainty is retained for audit and Table Sy.
 
-    with pd.ExcelWriter(data_path, engine='openpyxl') as writer:
-        df_all.to_excel(writer, sheet_name='All_Data', index=False)
-        summary_control.to_excel(writer, sheet_name='Summary_by_Control', index=False)
-        summary_by_p.to_excel(writer, sheet_name='Summary_by_p', index=False)
-    print(f"[Output] Combined data saved: {data_path}")
+    Table_Sx_Matching
+        Candidate-generation and matching diagnostics.
+
+    Table_Sy_Statistics
+        Mean performance, paired ΔF with 95% CI, BH-adjusted p,
+        and matched-pairs rank-biserial effect size.
+
+    Presentation choice
+    -------------------
+    Fig. 9 is intentionally kept as a clean quadrant scatter plot.
+    The paired 95% CIs are not drawn on the scatter; they remain fully
+    reported in Table_Sy_Statistics.
+    """
+    data_path = os.path.join(
+        output_dir,
+        "Opinion10_DDMR_Quadrant_Data.xlsx"
+    )
+
+    # -----------------------------------------------------
+    # Supplementary Table Sx: matching construction
+    # one row per network × seed ratio
+    # -----------------------------------------------------
+    matching_cols = [
+        'Network',
+        'p(%)',
+        'k',
+        'Initial_DegreeMatched_Candidates',
+        'DMR_Sets_Evaluated',
+        'DMD_Candidate_Pool_Size',
+        'DMD_Sets_Evaluated',
+        'DDMR_Caliper(%)',
+        'DDMR_Target_Sets',
+        'DDMR_Total_Candidates_Evaluated',
+        'DDMR_Candidates_Within_Caliper',
+        'DDMR_Acceptance_Rate(%)',
+        'DDMR_Selected_Count',
+        'DDMR_Selected_Mean_Relative_Ls_Error(%)',
+        'DDMR_Selected_Max_Relative_Ls_Error(%)',
+        'DDMR_Status',
+    ]
+
+    table_sx = (
+        df_all[
+            [c for c in matching_cols if c in df_all.columns]
+        ]
+        .drop_duplicates(
+            subset=['Network', 'p(%)']
+        )
+        .sort_values(
+            ['Network', 'p(%)']
+        )
+        .reset_index(drop=True)
+    )
+
+    # -----------------------------------------------------
+    # Supplementary Table Sy: quantitative comparisons
+    # -----------------------------------------------------
+    table_sy = df_all[
+        [
+            'Network',
+            'p(%)',
+            'Control',
+            'Control_Sets_Evaluated',
+            f'{proposed_label}_F(%)',
+            f'{proposed_label}_95CI',
+            'Control_F(%)',
+            'Control_95CI',
+            'Delta_F_Proposed_minus_Control(%)',
+            'Delta_F_95CI',
+            'P_BH',
+            'Rank_Biserial_r_rb',
+        ]
+    ].copy()
+
+    table_sy = table_sy.rename(
+        columns={
+            f'{proposed_label}_F(%)':
+                f'{proposed_label}_F_mean(%)',
+            f'{proposed_label}_95CI':
+                f'{proposed_label}_95CI_half',
+            'Control_95CI':
+                'Control_95CI_half',
+            'Delta_F_Proposed_minus_Control(%)':
+                'Delta_F(pp)',
+            'Delta_F_95CI':
+                'Delta_F_95CI_half(pp)',
+            'P_BH':
+                'p',
+            'Rank_Biserial_r_rb':
+                'r_rb',
+        }
+    )
+
+    table_sy = table_sy.sort_values(
+        ['Network', 'p(%)', 'Control']
+    ).reset_index(drop=True)
+
+    # -----------------------------------------------------
+    # Figure data: transparent audit of every plotted point
+    # -----------------------------------------------------
+    figure_cols = [
+        'Network',
+        'p(%)',
+        'Control',
+        'Control_Sets_Evaluated',
+        f'{proposed_label}_Ls',
+        'Control_Ls',
+        'Delta_Ls_Control_minus_Proposed',
+        f'{proposed_label}_F(%)',
+        'Control_F(%)',
+        'Delta_F_Proposed_minus_Control(%)',
+        'Delta_F_95CI',
+        'P_BH',
+        'Rank_Biserial_r_rb',
+    ]
+
+    figure_data = df_all[
+        [c for c in figure_cols if c in df_all.columns]
+    ].copy()
+
+    with pd.ExcelWriter(
+        data_path,
+        engine='openpyxl'
+    ) as writer:
+        figure_data.to_excel(
+            writer,
+            sheet_name='Figure_Data',
+            index=False,
+        )
+
+        table_sx.to_excel(
+            writer,
+            sheet_name='Table_Sx_Matching',
+            index=False,
+        )
+
+        table_sy.to_excel(
+            writer,
+            sheet_name='Table_Sy_Statistics',
+            index=False,
+        )
+
+    print(
+        f"[Output] Combined reviewer tables saved: "
+        f"{data_path}"
+    )
 
 
 # =========================================================
@@ -1049,20 +1656,17 @@ def parse_args():
     parser.add_argument('--repeats', type=int, default=20)
     parser.add_argument('--control-trials', type=int, default=1000,
                         help='Number of degree-matched random candidate seed sets.')
-    parser.add_argument('--dmr-eval-sets', type=int, default=5,
+    parser.add_argument('--dmr-eval-sets', type=int, default=10,
                         help='Number of DMR seed sets to evaluate and average.')
-    parser.add_argument('--ddmr-nearest', type=int, default=10,
-                        help='Maximum number of caliper-matched DDMR controls to evaluate and average.')
+    parser.add_argument('--ddmr-target-sets', type=int, default=10,
+                        help='Target number of valid DDMR control sets per network-ratio setting. '
+                             'If only 1-9 valid controls exist after the maximum search, all are used.')
     parser.add_argument('--ddmr-caliper', type=float, default=0.05,
                         help='Relative L_s matching caliper for DDMR. Default: 0.05 means <= 5%% error.')
-    parser.add_argument('--ddmr-min-matches', type=int, default=1,
-                        help='Minimum number of DDMR candidates required within the caliper before stopping adaptive search.')
     parser.add_argument('--ddmr-max-candidates', type=int, default=10000,
                         help='Maximum unique degree-matched candidates evaluated for DDMR caliper matching.')
     parser.add_argument('--ddmr-batch-size', type=int, default=1000,
                         help='Batch size for adaptive DDMR candidate generation.')
-    parser.add_argument('--allow-ddmr-fallback', action='store_true',
-                        help='If no candidate satisfies the caliper, use closest candidates anyway and mark as fallback. Default: off.')
     parser.add_argument('--degree-bins', type=int, default=10)
 
     parser.add_argument('--max-exact-pairs', type=int, default=6000,
@@ -1088,7 +1692,7 @@ def main():
     print(f"SIR: gamma={args.gamma}, lambda={args.threshold_multiplier}, blocks={args.blocks}, repeats={args.repeats}")
     print(
         f"Controls: trials={args.control_trials}, DMR sets={args.dmr_eval_sets}, "
-        f"DDMR nearest={args.ddmr_nearest}, DDMR caliper={args.ddmr_caliper*100:.1f}%, "
+        f"DDMR target={args.ddmr_target_sets}, DDMR caliper={args.ddmr_caliper*100:.1f}%, "
         f"DDMR max candidates={args.ddmr_max_candidates}"
     )
 

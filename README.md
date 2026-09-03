@@ -1,123 +1,169 @@
 # Mesoscopic Structural Holes (MSH)
 
-This repository contains the code and data used for the revised manuscript:
+Code, data, and reproducibility material for the revised manuscript:
 
-**Finding Influential Nodes via Clique-Aware Mesoscopic Structural Holes in Complex Networks**
+**Mesoscopic Structural Holes for Redundancy-Aware Node Ranking in Complex Networks**
 
-MSH is a topology-based node-ranking method for simple, unweighted, undirected **pairwise graphs**. It uses maximal cliques inferred from pairwise adjacency as mesoscopic cohesive units. The repository follows the revised manuscript terminology and does not treat inferred cliques as directly observed hyperedges, simplices, or collective events.
+MSH is a redundancy-aware topology-based **node-ranking method** for simple, unweighted, undirected pairwise graphs. Maximal cliques inferred from pairwise adjacency are treated as mesoscopic cohesive units. MSH combines effective dependence on affiliated cliques with inter-clique redundancy and assigns one structural priority score to each node.
 
-## Workflow
+The manuscript defines an MSH constraint coefficient `C_i`, where a smaller value indicates a stronger mesoscopic structural-hole position. The implementation exports the equivalent priority score `1 - C_i`, so throughout the released code **larger score = higher ranking priority**.
 
-![MSH workflow](images/workflow_msh.png)
-
-The workflow consists of three parts:
-
-1. **Clique-aware scoring.** Maximal cliques are enumerated from the processed pairwise graph. For each node, MSH evaluates clique-level effective dependence and inter-clique redundancy. A smaller MSH constraint coefficient indicates a stronger mesoscopic structural-hole position.
-2. **Influential-node evaluation.** The resulting rankings are evaluated by SIR spreading, node-overlap analysis, ranking resolution, seed-set dispersion, and ablation analysis.
-3. **Computational evaluation.** Runtime experiments examine network-size effects, average-degree stress, clustering-related stress, and clique-structure indicators.
+The revised evaluation focuses on ranking-derived node sets rather than isolated-node SIR superiority. It includes collective multi-seed SIR spreading, ranking resolution, node-set redundancy, matched controls, all-node structural rank correlations, ablation studies, and computational stress tests.
 
 ## Repository layout
 
 ```text
-MSH_revised_repository/
-├── msh_methods.py                  # MSH, baselines, and ablation variants
-├── network_loader.py               # Dataset loading and preprocessing
-├── precompute_rankings.py          # Ranking-cache generation
+MSH_second_revision/
+├── README.md
+├── CITATION.cff
+├── CHANGELOG.md
+├── REVISION_VERSION.txt
+├── requirements.txt
+├── reproduce_all.py
+├── msh_methods.py
+├── hosh_methods.py                  # compatibility wrapper for legacy cache keys
+├── network_loader.py
+├── precompute_rankings.py
 ├── configs/
-│   └── revision_parameters.json    # Main parameters used in the revision
+│   └── revision_parameters.json
 ├── docs/
-│   ├── DATASETS.md                 # Dataset sources and preprocessing notes
-│   ├── REPRODUCIBILITY.md          # Execution order and reproducibility notes
-│   └── figure_table_manifest.csv   # Figure/table-to-script mapping
-├── experiments/                    # Scripts for manuscript figures and tables
-├── images/
-│   └── workflow_msh.png            # Workflow figure shown above
-├── networks_data/                  # Local network files
-├── results/                        # Generated outputs and caches
-└── tools/                          # Preprocessing and structural-statistics utilities
+│   ├── DATASETS.md
+│   ├── REPRODUCIBILITY.md
+│   ├── STATISTICAL_PROTOCOL.md
+│   ├── REVIEWER_RESPONSE_MAPPING.md
+│   ├── VOTERANK_TIE_AUDIT.md
+│   ├── FINAL_AUDIT.md
+│   ├── figure_table_manifest.csv
+│   ├── RELEASE_CHECKLIST.md
+│   └── *_sha256.txt
+├── experiments/
+├── tools/
+├── tests/
+├── reference_results/
+│   ├── Table_S6.xlsx
+│   ├── Table_S7.xlsx
+│   ├── Table_S10.xlsx
+│   └── Table_S11.xlsx
+├── networks_data/
+└── results/
 ```
 
-`hosh_methods.py` is kept only as a backward-compatible wrapper for older script imports. Public-facing descriptions use **MSH**.
+Some revision scripts and caches retain the historical internal identifier `HOSH`. Public manuscript labels use **MSH**. `msh_methods.py` accepts both identifiers so the released code remains compatible with the exact revision workflow.
 
 ## Installation
 
 Python 3.10 or later is recommended.
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-The main dependencies are `networkx`, `numpy`, `pandas`, `scipy`, `matplotlib`, `tqdm`, `openpyxl`, `python-igraph`, and `python-louvain`.
+Main dependencies are NetworkX, NumPy, pandas, SciPy, Matplotlib, tqdm, openpyxl, python-igraph, and python-louvain.
 
-## Reproducing the revised results
+## Quick validation
 
-Run all commands from the repository root.
-
-### 1. Check preprocessing and generate rankings
+Before running the full experiments:
 
 ```bash
-python -m tools.evaluate_preprocessing_original_vs_processed
-python precompute_rankings.py --force
+python -m tools.validate_repository
+python -m tools.validate_reference_results
+pytest -q
 ```
 
-### 2. Reproduce the main manuscript results
-
-```bash
-python -m experiments.exp01_top10_node_overlap_tables3_5
-python -m experiments.exp02_sir_seed_ratio_fig3
-python -m experiments.exp03_temporal_sir_fig4_table6
-python -m experiments.exp04_beta_robustness_fig5
-python -m experiments.exp05_monotonicity_table7
-python -m experiments.exp06_ranking_frequency_fig6
-python -m experiments.exp07_seed_dispersion_fig7
-python -m experiments.exp08_topology_visualization_fig8
-python -m experiments.exp09_matched_controls_fig9
-python -m experiments.exp10_ablation_table8
-python -m experiments.exp11_runtime_scale_fig10
-python -m experiments.exp12_average_degree_stress_fig11_tableS4
-```
-
-### 3. Reproduce supplementary analyses
-
-```bash
-python -m experiments.exp13_tie_breaking_tableS2
-python -m experiments.exp14_recovery_rate_tableS3
-python -m experiments.exp15_clustering_stress_tableS5
-```
-
-The complete figure/table mapping is provided in `docs/figure_table_manifest.csv`.
+The lightweight validation checks repository structure, dataset files, reference tables, source syntax, and the deterministic VoteRank tie rule. It does **not** rerun the expensive SIR experiments.
 
 ## Data preprocessing
 
-All empirical networks are converted to simple, unweighted, undirected graphs before ranking and SIR evaluation. The preprocessing pipeline is:
+All nine empirical datasets are converted to simple, unweighted, undirected graphs. Directed edges are symmetrized, repeated/temporal interactions are aggregated through the simple-graph representation, self-loops are removed, the largest connected component is retained, and nodes are relabeled to consecutive integer IDs starting from 0.
 
-1. convert directed edges to undirected edges;
-2. aggregate repeated or temporal interactions into static unweighted edges;
-3. remove self-loops;
-4. extract the largest connected component;
-5. relabel nodes to consecutive integer IDs.
+Dataset paths and source notes are documented in `docs/DATASETS.md`.
 
-Dataset descriptions and source notes are provided in `docs/DATASETS.md`.
+## Maximal-clique enumeration
 
-## Experimental settings
+The released workflow uses **exact maximal-clique enumeration**. The concrete backend is documented rather than hidden behind a more specific algorithm claim:
 
-The revision parameters are recorded in `configs/revision_parameters.json`. The main settings are:
+- empirical ranking/cache generation: `python-igraph` `Graph.maximal_cliques()`;
+- method-library fallback when igraph is unavailable: NetworkX `find_cliques()`;
+- average-degree and clustering stress scripts: NetworkX exact enumeration by default.
 
-- SIR model: synchronous discrete-time network SIR;
-- main recovery probability: `gamma = 1`;
-- main infection probability: `beta = 2.5 * beta_th`;
-- seed ratios: `1%` to `10%`;
-- temporal SIR experiment: `k = 10` seeds;
-- SIR repetitions: 50 random-seed blocks × 20 simulations per block;
-- statistical test: paired Wilcoxon signed-rank test with Benjamini-Hochberg correction;
-- main tie-breaking: ascending node ID after relabeling;
-- monotonicity: identical scores are treated as tied groups.
+These backends enumerate maximal cliques exactly; the repository does not claim that every experiment uses the same internal enumeration implementation.
 
-## Computational notes
+## Baseline settings and deterministic VoteRank ties
 
-Maximal cliques are enumerated using the exact Bron-Kerbosch algorithm with pivoting and degeneracy ordering. Runtime analyses report clique-enumeration time, score-computation time, confidence intervals over independently generated synthetic instances, and clique-structure indicators. Separate peak-memory profiling is not included, so no claim is made about memory efficiency or memory scalability.
+Exact fixed settings are recorded in `configs/revision_parameters.json` and Supplementary Table S3. In particular:
 
-## Outputs
+- CI shell radius: `2`;
+- VoteRank initial voting ability: `1`;
+- VoteRank neighbor decrement: `1/<k>`;
+- VoteRank selected-node voting ability: `0`;
+- VoteRank **internal voting-score ties: ascending node ID**;
+- SNIM minimum maximal-clique size: `3`;
+- CHBC: Louvain, resolution `1`, random seed `42`.
 
-Generated outputs are written to `results/`, including ranking caches, figures, and tables.
+The VoteRank tie rule is now explicit in `msh_methods.calculate_voterank()`. An audit confirmed that this explicit rule reproduces the complete VoteRank ordering produced by the uploaded revision implementation on all nine empirical networks; see `docs/VOTERANK_TIE_AUDIT.md`.
 
+For ordinary static score rankings, top-k ties are resolved by ascending node ID after relabeling. Monotonicity and Kendall `tau_b` analyses intentionally retain score ties and do not apply ID tie-breaking.
+
+## Statistical unit
+
+SIR experiments use 50 Monte Carlo blocks with 20 stochastic realizations per block. The **mean of the 20 realizations within one block is one statistical observation**, so inferential tests use `n = 50` paired block means rather than 1000 individual simulations.
+
+For a fixed network and experimental setting, the network topology and ranked node set are fixed. Only stochastic SIR realizations vary across blocks and repetitions. Paired methods use a method-independent pseudo-random seed schedule (common random-number initialization).
+
+See `docs/STATISTICAL_PROTOCOL.md` for confidence intervals, Wilcoxon tests, rank-biserial effect sizes, Friedman testing, Kendall `tau_b`, and BH correction families.
+
+## Reproduce rankings and manuscript analyses
+
+Precompute ranking/clique caches:
+
+```bash
+python precompute_rankings.py --force
+```
+
+Run individual analyses using the commands listed in `docs/figure_table_manifest.csv`, or inspect the complete ordered plan with:
+
+```bash
+python reproduce_all.py --list
+python reproduce_all.py --dry-run
+```
+
+A full sequential reproduction can be started with:
+
+```bash
+python reproduce_all.py
+```
+
+The full run is computationally expensive. `reproduce_all.py` also supports `--only`, `--from-step`, `--through-step`, and `--continue-on-error`; see `python reproduce_all.py --help`.
+
+## Matched-control reproducibility
+
+`experiments/exp10_matched_controls_fig10_tablesS6S7.py` implements the reviewer-requested protocol:
+
+- 10 degree-quantile bins;
+- up to 1000 unique initial degree-matched candidates;
+- DMR: 10 randomly selected candidates;
+- DMD: one maximum-`L_s` candidate from the initial pool;
+- DDMR: relative `L_s` error `<= 5%`;
+- adaptive DDMR search up to 10000 unique candidates;
+- if only 1-9 valid DDMR controls are found, all are retained;
+- zero valid controls are reported as unmatched with no out-of-caliper fallback;
+- multiple DMR/DDMR controls are averaged within each Monte Carlo block, preserving the block as the inferential unit;
+- `L_s` is exact for up to 6000 unordered node pairs and uses up to 6000 sampled pairs for larger selected sets.
+
+The supplied regression references support the manuscript summaries: valid DDMR controls in `79/90` settings, and larger MSH final spread in `85/90` DMR, `75/90` DMD, and `74/79` valid DDMR comparisons.
+
+## Recovery-rate robustness
+
+Supplementary Table S5 uses the recovery-rate robustness workflow retained from the first revision. `experiments/exp16_recovery_rate_tableS5.py` varies `gamma = 0.5, 0.75, 1.0` and adjusts `beta` to keep the effective edge transmissibility equal to `2.5 * beta_th`, exactly as described in the current Supplementary Material.
+
+## Reference outputs
+
+`reference_results/` contains the supplied final reference spreadsheets for Tables S6, S7, S10, and S11. They are included as regression references for the final audit; the experiment scripts are the source of the computational procedure.
+
+## Reviewer-to-code map
+
+`docs/REVIEWER_RESPONSE_MAPPING.md` maps each major second-round reviewer concern to the corresponding source files. `docs/figure_table_manifest.csv` maps each manuscript figure/table to the script that generates it.
+
+## Immutable release
+
+Before resubmission, freeze this repository, create a GitHub release, archive the exact release in Zenodo (or another immutable archive), and fill `REVISION_VERSION.txt` with the final Git commit, release tag, DOI, and date. The manuscript Availability statement should cite the same immutable version rather than only the moving repository homepage.
