@@ -1,22 +1,12 @@
 # Mesoscopic Structural Holes (MSH)
 
-Code and data for reproducing the experiments in **Mesoscopic Structural Holes for Redundancy-Aware Node Ranking in Complex Networks**.
+MSH is a topology-based node-ranking method for simple, unweighted, undirected networks. It uses maximal cliques as mesoscopic cohesive units and combines effective dependence with inter-clique redundancy to quantify the structural priority of each node.
 
-MSH is a topology-based node-ranking method for simple, unweighted, undirected graphs. The implementation computes the MSH constraint coefficient \(C_i\) and exports the equivalent priority score \(1-C_i\), so **larger scores indicate higher ranking priority**.
+The method defines a constraint coefficient `C_i`, where a smaller value indicates a stronger mesoscopic structural-hole position. The code uses the equivalent priority score `1 - C_i`, so **larger score = higher ranking priority**.
 
 ## Workflow
 
-```mermaid
-flowchart TD
-    A[Raw network data] --> B[Network preprocessing]
-    B --> C[Maximal-clique enumeration]
-    C --> D[MSH and baseline ranking]
-    D --> E[Precompute ranking caches]
-    E --> F[Run experiment scripts]
-    F --> G[SIR / redundancy / correlation / ablation / efficiency analyses]
-    G --> H[Generate figures and supplementary tables]
-    H --> I[Validate repository and reference outputs]
-```
+![MSH workflow](images/workflow_msh.png)
 
 ## Repository structure
 
@@ -30,12 +20,18 @@ MSH/
 ├── network_loader.py
 ├── precompute_rankings.py
 ├── configs/
-│   └── revision_parameters.json
+│   └── parameters.json
+├── docs/
+│   ├── DATASETS.md
+│   ├── REPRODUCIBILITY.md
+│   ├── STATISTICAL_PROTOCOL.md
+│   └── figure_table_manifest.csv
 ├── experiments/
 ├── tools/
 ├── tests/
 ├── reference_results/
 ├── networks_data/
+├── images/
 └── results/
 ```
 
@@ -47,45 +43,18 @@ Python 3.10 or later is recommended.
 python -m pip install -r requirements.txt
 ```
 
-## Data preprocessing
+## Quick start
 
-All empirical networks are converted to simple, unweighted, undirected graphs. Directed edges are symmetrized, repeated or temporal interactions are aggregated, self-loops are removed, the largest connected component is retained, and nodes are relabeled to consecutive integer IDs.
-
-## Ranking and maximal-clique enumeration
-
-Maximal cliques are enumerated exactly. The empirical ranking workflow uses `python-igraph` `Graph.maximal_cliques()`, while NetworkX `find_cliques()` is available as a fallback and is also used in the stress-test scripts.
-
-For static rankings, ties are resolved by ascending node ID after relabeling. VoteRank also resolves internal voting-score ties by ascending node ID.
-
-## Main parameter settings
-
-- MSH stability constant: `1e-3`
-- CI shell radius: `2`
-- VoteRank initial voting ability: `1`
-- VoteRank neighbor decrement: `1/<k>`
-- VoteRank selected-node voting ability: `0`
-- VoteRank internal tie-breaking: ascending node ID
-- SNIM minimum maximal-clique size: `3`
-- CHBC: Louvain, resolution `1`, random seed `42`
-
-## Reproduction
-
-Precompute ranking and clique caches:
+Precompute rankings and maximal-clique caches:
 
 ```bash
 python precompute_rankings.py --force
 ```
 
-List the experiment workflow:
+List all available analysis steps:
 
 ```bash
 python reproduce_all.py --list
-```
-
-Check the workflow without running experiments:
-
-```bash
-python reproduce_all.py --dry-run
 ```
 
 Run the complete workflow:
@@ -94,9 +63,53 @@ Run the complete workflow:
 python reproduce_all.py
 ```
 
-Individual scripts in `experiments/` can also be run separately.
+Run selected steps only:
+
+```bash
+python reproduce_all.py --only fig3 fig10 fig11data fig11
+```
+
+Additional options are available with:
+
+```bash
+python reproduce_all.py --help
+```
+
+## Data
+
+The empirical network files are stored in `networks_data/`. The loader converts each dataset to a simple, unweighted, undirected graph, removes self-loops, retains the largest connected component, and relabels nodes to consecutive integer IDs.
+
+Dataset paths and source notes are listed in `docs/DATASETS.md`.
+
+## Main settings
+
+Fixed method and simulation settings are stored in `configs/parameters.json`.
+
+Key implementation choices include:
+
+- exact maximal-clique enumeration;
+- CI shell radius: `2`;
+- VoteRank voting-score ties: ascending node ID;
+- SNIM minimum maximal-clique size: `3`;
+- CHBC: Louvain, resolution `1`, random seed `42`;
+- SIR experiments: 50 Monte Carlo blocks × 20 realizations per block;
+- one block mean is treated as one statistical observation.
+
+For static rankings, score ties are resolved by ascending node ID after relabeling. Monotonicity and Kendall `tau_b` analyses retain score ties.
+
+## Reproducing figures and tables
+
+Each analysis is implemented as an independent script in `experiments/`. The mapping between scripts and generated figures/tables is provided in:
+
+```text
+docs/figure_table_manifest.csv
+```
+
+Generated outputs are written under `results/`.
 
 ## Validation
+
+Run the lightweight repository and reference-output checks with:
 
 ```bash
 python -m tools.validate_repository
@@ -104,4 +117,4 @@ python -m tools.validate_reference_results
 pytest -q
 ```
 
-The validation checks repository structure, datasets, reference outputs, source syntax, and deterministic ranking rules.
+These checks validate repository structure, dataset availability, reference tables, source syntax, and deterministic VoteRank tie handling without rerunning the full SIR workflow.
